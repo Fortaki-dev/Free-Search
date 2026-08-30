@@ -4,17 +4,18 @@ import json
 import random
 import time
 import threading
-import requests
 import hashlib
 import base64
 import subprocess
-import shutil
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QRect
+from PyQt6.QtCore import (
+    Qt, QUrl, QThread, pyqtSignal, QTimer, QPropertyAnimation,
+    QEasingCurve, QPoint, QRect, QEventLoop
+)
 from PyQt6.QtGui import QAction, QFont, QIcon, QColor, QPalette, QBrush, QRadialGradient, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,10 +24,13 @@ from PyQt6.QtWidgets import (
     QSlider, QCheckBox, QInputDialog, QFileDialog, QGroupBox
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineScript, QWebEngineSettings, QWebEnginePage
-from PyQt6.QtNetwork import QNetworkProxy
+from PyQt6.QtWebEngineCore import (
+    QWebEngineProfile, QWebEngineScript, QWebEngineSettings,
+    QWebEnginePage, QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo
+)
+from PyQt6.QtNetwork import QNetworkProxy, QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
-# Отключаем глобальный прокси (затем будет установлен нами)
+# Отключаем глобальный прокси
 QNetworkProxy.setApplicationProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
 
 # Flask + зависимости
@@ -35,16 +39,30 @@ from flask_cors import CORS
 from deep_translator import GoogleTranslator
 from ddgs import DDGS
 
-# ---------- Пытаемся импортировать torch и tokenizers ----------
+# ---------- Шифрование паролей ---------
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.fernet import Fernet
+import base64
+
+# ---------- Импорт для Safe Browsing ----------
+import json as jsonlib
+
+# ---------- Попытка импорта torch и transformers ----------
 try:
     import torch
     import torch.nn as nn
     from torch.nn import functional as F
     from tokenizers import Tokenizer
+    from transformers import GPT2Config, GPT2LMHeadModel, AutoTokenizer
     TORCH_AVAILABLE = True
-except ImportError:
+    TRANSFORMERS_AVAILABLE = True
+except ImportError as e:
     TORCH_AVAILABLE = False
-    print("[WARN] PyTorch или tokenizers не установлены. Локальная ИИ-модель недоступна.")
+    TRANSFORMERS_AVAILABLE = False
+    print(f"[WARN] Не удалось импортировать PyTorch или transformers: {e}")
 
 # ---------- resource_path ----------
 def resource_path(relative_path):
@@ -60,15 +78,16 @@ if getattr(sys, 'frozen', False):
 else:
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Папка для скачанных сайтов (рядом с приложением)
 LOAD_DIR = os.path.join(CURRENT_DIR, "load")
 os.makedirs(LOAD_DIR, exist_ok=True)
 
-# Папка AI для модели
 AI_DIR = os.path.join(CURRENT_DIR, "AI")
 os.makedirs(AI_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(AI_DIR, "micro_gpt_8m.bin")   # или micro_gpt_5m.bin
-TOKENIZER_PATH = os.path.join(AI_DIR, "micro_bpe_16k.json")
+
+GPT2_TOKENIZER_DIR = os.path.join(AI_DIR, "tokenizer")
+GPT2_MODEL_PATH = os.path.join(AI_DIR, "micro_gpt_170m.bin")
+NANOGPT_MODEL_PATH = os.path.join(AI_DIR, "micro_gpt_170m.bin")
+NANOGPT_TOKENIZER_PATH = os.path.join(AI_DIR, "tokenizer")
 
 # ---------- ПАПКА ДАННЫХ В AppData ----------
 def get_data_dir():
@@ -85,7 +104,6 @@ DATA_DIR = get_data_dir()
 SAVE_DIR = os.path.join(DATA_DIR, "save")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# ---------- Файлы данных ----------
 SETTINGS_FILE = os.path.join(SAVE_DIR, "settings.json")
 PASSWORD_FILE = os.path.join(SAVE_DIR, "passwords.json")
 BACKGROUNDS_FILE = os.path.join(SAVE_DIR, "backgrounds.json")
@@ -114,9 +132,161 @@ def save_settings(settings):
         json.dump(settings, f, indent=2)
 
 # ================================================================
-#  ЛОКАЛЬНАЯ МОДЕЛЬ (архитектура и загрузка) – скопировано из chat.py
+#  БЛОКИРОВЩИК РЕКЛАМЫ (на основе EasyList)
 # ================================================================
+class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
+    def __init__(self, blocked_domains=None):
+        super().__init__()
+        self.blocked_domains = blocked_domains or set()
+        self.load_easylist()
 
+    def load_easylist(self):
+        try:
+            import requests
+            url = "https://easylist.to/easylist/easylist.txt"
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith('!'):
+                        if line.startswith('||') and '^' in line:
+                            domain = line[2:line.index('^')]
+                            self.blocked_domains.add(domain)
+                print(f"[ADBLOCK] Загружено {len(self.blocked_domains)} доменов из EasyList")
+            else:
+                print("[ADBLOCK] Не удалось загрузить EasyList, использую встроенный список")
+                fallback = [
+                    "doubleclick.net", "googleadservices.com", "googlesyndication.com",
+                    "facebook.com/tr", "amazon-adsystem.com", "adnxs.com", "adsrvr.org",
+                    "rubiconproject.com", "pubmatic.com", "openx.net", "criteo.com",
+                    "taboola.com", "outbrain.com", "adform.net", "indexexchange.com"
+                ]
+                self.blocked_domains.update(fallback)
+        except Exception as e:
+            print(f"[ADBLOCK] Ошибка загрузки EasyList: {e}")
+
+    def interceptRequest(self, info):
+        url = info.requestUrl().toString()
+        for domain in self.blocked_domains:
+            if domain in url:
+                info.block(True)
+                return
+
+# ================================================================
+#  КЛАСС ДЛЯ GOOGLE SAFE BROWSING (Lookup API) С QNetworkAccessManager И КЕШЕМ
+# ================================================================
+class SafeBrowsingChecker:
+    def __init__(self, api_key, parent=None):
+        self.api_key = api_key
+        self.api_url = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
+        self.enabled = self.api_key and self.api_key != "AIzaSyCxIKEwIyckbHKQS4nrKQ1MMizJDyrRrxM"
+        self.nam = QNetworkAccessManager(parent)
+        self.cache = {}  # {domain: (is_safe, threat_type, timestamp)}
+        self.cache_ttl = 3600  # 1 час
+
+    def check_url_sync(self, url):
+        if not self.enabled:
+            return True, None
+        if url.startswith(("http://127.0.0.1:5000", "about:blank", "file://")):
+            return True, None
+
+        try:
+            parsed = urllib.parse.urlparse(url)
+            domain = parsed.netloc or parsed.path
+            if not domain:
+                return True, None
+        except Exception:
+            return True, None
+
+        now = time.time()
+        if domain in self.cache:
+            is_safe, threat_type, timestamp = self.cache[domain]
+            if now - timestamp < self.cache_ttl:
+                return is_safe, threat_type
+            else:
+                del self.cache[domain]
+
+        is_safe, threat_type = self._send_request(url)
+        self.cache[domain] = (is_safe, threat_type, now)
+        return is_safe, threat_type
+
+    def _send_request(self, url):
+        payload = {
+            "client": {"clientId": "FreeSearch", "clientVersion": "1.16"},
+            "threatInfo": {
+                "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+                "platformTypes": ["ANY_PLATFORM"],
+                "threatEntryTypes": ["URL"],
+                "threatEntries": [{"url": url}]
+            }
+        }
+        data = jsonlib.dumps(payload).encode('utf-8')
+
+        request = QNetworkRequest(QUrl(f"{self.api_url}?key={self.api_key}"))
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+
+        reply = self.nam.post(request, data)
+        loop = QEventLoop()
+        reply.finished.connect(loop.quit)
+        QTimer.singleShot(5000, loop.quit)
+        loop.exec()
+
+        if reply.error() == QNetworkReply.NetworkError.NoError:
+            try:
+                response_data = reply.readAll().data().decode('utf-8')
+                data = jsonlib.loads(response_data)
+                if "matches" in data and len(data["matches"]) > 0:
+                    threat_type = data["matches"][0].get("threatType", "UNKNOWN")
+                    reply.deleteLater()
+                    return False, threat_type
+                else:
+                    reply.deleteLater()
+                    return True, None
+            except Exception as e:
+                print(f"[SafeBrowsing] Ошибка обработки ответа: {e}")
+                reply.deleteLater()
+                return True, None
+        else:
+            print(f"[SafeBrowsing] Ошибка сети: {reply.errorString()}")
+            reply.deleteLater()
+            return True, None
+
+# ================================================================
+#  КАСТОМНАЯ СТРАНИЦА ДЛЯ ПЕРЕХВАТА НАВИГАЦИИ С SAFE BROWSING
+# ================================================================
+class SafeBrowsingWebEnginePage(QWebEnginePage):
+    def __init__(self, profile, browser_window, parent=None):
+        super().__init__(profile, parent)
+        self.browser_window = browser_window
+
+    def acceptNavigationRequest(self, url, navigation_type, is_main_frame):
+        if is_main_frame:
+            url_str = url.toString()
+            is_safe, threat_type = self.browser_window.safe_browsing.check_url_sync(url_str)
+            if not is_safe:
+                threat_names = {
+                    "MALWARE": "Вредоносное ПО",
+                    "SOCIAL_ENGINEERING": "Фишинг / Мошенничество",
+                    "UNWANTED_SOFTWARE": "Нежелательное ПО",
+                    "POTENTIALLY_HARMFUL_APPLICATION": "Потенциально опасное приложение"
+                }
+                threat_name = threat_names.get(threat_type, threat_type or "Неизвестная угроза")
+                reply = QMessageBox.warning(
+                    self.browser_window,
+                    "⚠️ Опасный сайт",
+                    f"<b>Google Safe Browsing</b> обнаружил угрозу: <b>{threat_name}</b>\n\n"
+                    f"URL: {url_str}\n\n"
+                    "Этот сайт может быть опасным. Вы уверены, что хотите продолжить?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.No:
+                    return False
+        return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
+
+# ================================================================
+#  МОДЕЛЬ NANOGPT (для ответов в поиске)
+# ================================================================
 BLOCK_SIZE = 64
 VOCAB_SIZE = 16000
 N_EMBD = 192
@@ -135,7 +305,6 @@ class Head(nn.Module):
         self.query = nn.Linear(N_EMBD, head_size, bias=False)
         self.value = nn.Linear(N_EMBD, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
-        
     def forward(self, x):
         B, T, C = x.shape
         k, q, v = self.key(x), self.query(x), self.value(x)
@@ -148,20 +317,14 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(N_EMBD, N_EMBD)
-        
-    def forward(self, x): 
+    def forward(self, x):
         return self.proj(torch.cat([h(x) for h in self.heads], dim=-1))
 
 class FeedFoward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd), 
-            nn.ReLU(), 
-            nn.Linear(4 * n_embd, n_embd)
-        )
-        
-    def forward(self, x): 
+        self.net = nn.Sequential(nn.Linear(n_embd, 4 * n_embd), nn.ReLU(), nn.Linear(4 * n_embd, n_embd))
+    def forward(self, x):
         return self.net(x)
 
 class Block(nn.Module):
@@ -170,7 +333,6 @@ class Block(nn.Module):
         self.sa = MultiHeadAttention(n_head, n_embd // n_head)
         self.ffwd = FeedFoward(n_embd)
         self.ln1, self.ln2 = nn.LayerNorm(n_embd), nn.LayerNorm(n_embd)
-        
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         return x + self.ffwd(self.ln2(x))
@@ -183,7 +345,6 @@ class NanoGPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(N_EMBD, n_head=N_HEAD) for _ in range(N_LAYER)])
         self.ln_f = nn.LayerNorm(N_EMBD)
         self.lm_head = nn.Linear(N_EMBD, VOCAB_SIZE)
-        
     def forward(self, idx):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
@@ -192,120 +353,145 @@ class NanoGPT(nn.Module):
         x = self.blocks(x)
         return self.lm_head(self.ln_f(x))
 
-# ----- Глобальные переменные для модели -----
-model = None
-tokenizer = None
-model_loaded = False
+model_nano = None
+tokenizer_nano = None
+model_nano_loaded = False
 
-def load_local_model():
-    global model, tokenizer, model_loaded
+def load_nanogpt():
+    global model_nano, tokenizer_nano, model_nano_loaded
     if not TORCH_AVAILABLE:
-        print("[INFO] PyTorch/tokenizers не установлены, локальная модель не будет загружена.")
         return False
-
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(TOKENIZER_PATH):
-        print(f"[INFO] Файлы модели не найдены в {AI_DIR}. Локальная ИИ отключена.")
+    if not os.path.exists(GPT2_MODEL_PATH) or not os.path.exists(GPT2_TOKENIZER_DIR):
+        print(f"[INFO] Файлы NanoGPT не найдены в {AI_DIR}. Модель отключена.")
         return False
-
     try:
-        print("[INFO] Загрузка токенизатора (Tokenizer.from_file)...")
-        tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-        print("[INFO] Токенизатор загружен.")
-
-        print("[INFO] Загрузка модели (это может занять время)...")
-        model = NanoGPT().to(DEVICE)
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-        model.eval()
-        model_loaded = True
-        print(f"[SUCCESS] Локальная ИИ-модель загружена на {DEVICE.upper()}!")
+        tokenizer_nano = Tokenizer.from_file(NANOGPT_TOKENIZER_PATH)
+        model_nano = NanoGPT().to(DEVICE)
+        model_nano.load_state_dict(torch.load(GPT2_MODEL_PATH, map_location=DEVICE))
+        model_nano.eval()
+        model_nano_loaded = True
+        print(f"[SUCCESS] NanoGPT загружена на {DEVICE.upper()}!")
         return True
     except Exception as e:
-        print(f"[ERROR] Не удалось загрузить локальную модель: {e}")
-        import traceback
-        traceback.print_exc()
-        model = None
-        tokenizer = None
-        model_loaded = False
+        print(f"[ERROR] Не удалось загрузить NanoGPT: {e}")
+        model_nano = None
+        tokenizer_nano = None
+        model_nano_loaded = False
         return False
 
-load_local_model()
-
-# ================================================================
-#  ФУНКЦИЯ ГЕНЕРАЦИИ ОТВЕТА С КОНТЕКСТОМ (сниппеты поиска)
-# ================================================================
-
 def generate_ai_answer(query, lang='ru', context=''):
-    """Генерирует ответ, используя локальную модель и переданный контекст (сниппеты)."""
-    global model, tokenizer, model_loaded
-    if not model_loaded or model is None or tokenizer is None:
+    global model_nano, tokenizer_nano, model_nano_loaded
+    if not model_nano_loaded or model_nano is None or tokenizer_nano is None:
         return f"Я — локальный ИИ-помощник. Модель пока не загружена или отсутствует. Ваш вопрос: {query}"
-
     try:
-        # Формируем промпт: вопрос + контекст (если есть)
         prompt = f"Вопрос: {query}\n"
         if context:
             prompt += context + "\n"
         prompt += "Ответ:"
-        
-        prompt_ids = tokenizer.encode(prompt).ids
+        prompt_ids = tokenizer_nano.encode(prompt).ids
         context_tokens = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
-        
         generated_tokens = []
         accumulated_text = ""
-        
         with torch.no_grad():
             for i in range(BLOCK_SIZE):
                 context_cond = context_tokens[:, -BLOCK_SIZE:]
-                logits = model(context_cond)
+                logits = model_nano(context_cond)
                 logits = logits[:, -1, :] / TEMPERATURE
-                
-                # Штраф за повторения
                 if len(generated_tokens) > 0:
                     for token_id in set(generated_tokens):
                         if logits[0, token_id] > 0:
                             logits[0, token_id] /= REPETITION_PENALTY
                         else:
                             logits[0, token_id] *= REPETITION_PENALTY
-                
-                # Top-K фильтрация
                 v, _ = torch.topk(logits, TOP_K)
                 logits[logits < v[:, [-1]]] = float('-inf')
-                
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
-                
                 generated_tokens.append(next_token.item())
                 context_tokens = torch.cat((context_tokens, next_token), dim=1)
-                
-                token_text = tokenizer.decode([next_token.item()])
+                token_text = tokenizer_nano.decode([next_token.item()])
                 if not token_text:
                     continue
-                
-                # Остановка при появлении переноса или спецсимвола
                 if "\n" in token_text or token_text in ["[EOS]", "###"]:
                     break
-                    
                 accumulated_text += " " + token_text.strip()
-                
                 if "Вопрос" in accumulated_text:
                     accumulated_text = accumulated_text.split("Вопрос")[0]
                     break
-
-        # Очистка текста от лишних пробелов перед знаками препинания
         clean_output = accumulated_text.strip()
         replacements = {" .": ".", " ,": ",", " ?": "?", " !": "!", " :": ":", " - ": "-"}
         for old, new in replacements.items():
             clean_output = clean_output.replace(old, new)
-            
         return clean_output if clean_output else "Извините, я не смог сгенерировать ответ."
     except Exception as e:
-        print(f"[ERROR] Ошибка генерации ИИ: {e}")
+        print(f"[ERROR] Ошибка генерации NanoGPT: {e}")
         return "Извините, произошла ошибка при генерации ответа."
+
+# ================================================================
+#  МОДЕЛЬ GPT-2 (для чата)
+# ================================================================
+gpt2_model = None
+gpt2_tokenizer = None
+gpt2_loaded = False
+
+def load_gpt2():
+    global gpt2_model, gpt2_tokenizer, gpt2_loaded
+    if not TORCH_AVAILABLE or not TRANSFORMERS_AVAILABLE:
+        return False
+    if not os.path.exists(GPT2_TOKENIZER_DIR) or not os.path.exists(GPT2_MODEL_PATH):
+        print(f"[INFO] Файлы GPT-2 не найдены в {AI_DIR}. Модель отключена.")
+        return False
+    try:
+        gpt2_tokenizer = AutoTokenizer.from_pretrained(GPT2_TOKENIZER_DIR, clean_up_tokenization_spaces=False)
+        if gpt2_tokenizer.pad_token is None:
+            gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
+        config = GPT2Config(vocab_size=50257, n_positions=512, n_embd=512, n_layer=16, n_head=8)
+        gpt2_model = GPT2LMHeadModel(config)
+        gpt2_model.load_state_dict(torch.load(GPT2_MODEL_PATH, map_location=DEVICE))
+        gpt2_model.to(DEVICE)
+        gpt2_model.eval()
+        gpt2_loaded = True
+        print(f"[SUCCESS] GPT-2 модель загружена на {DEVICE.upper()}!")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Не удалось загрузить GPT-2: {e}")
+        gpt2_model = None
+        gpt2_tokenizer = None
+        gpt2_loaded = False
+        return False
+
+def generate_gpt2_reply(user_text):
+    global gpt2_model, gpt2_tokenizer, gpt2_loaded
+    if not gpt2_loaded or gpt2_model is None or gpt2_tokenizer is None:
+        return "Модель GPT-2 не загружена. Проверьте папку AI."
+    try:
+        bos = gpt2_tokenizer.bos_token if gpt2_tokenizer.bos_token else ""
+        prompt = f"{bos}Вопрос: {user_text}\nОтвет:"
+        input_ids = gpt2_tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            output_ids = gpt2_model.generate(
+                input_ids,
+                max_new_tokens=100,
+                do_sample=True,
+                temperature=0.2,
+                top_k=25,
+                top_p=0.85,
+                repetition_penalty=1.3,
+                pad_token_id=gpt2_tokenizer.pad_token_id,
+                eos_token_id=gpt2_tokenizer.eos_token_id
+            )
+        reply = gpt2_tokenizer.decode(output_ids[0][len(input_ids[0]):], skip_special_tokens=True)
+        return reply.strip() if reply.strip() else "Извините, я не смог ответить."
+    except Exception as e:
+        print(f"[ERROR] Ошибка генерации GPT-2: {e}")
+        return "Произошла ошибка при генерации ответа."
+
+# Загружаем модели при старте
+load_gpt2()
 
 # ================================================================
 #  FLASK API
 # ================================================================
-
 app = Flask(__name__, static_folder=STATIC_DIR, template_folder=STATIC_DIR)
 CORS(app)
 
@@ -370,16 +556,25 @@ def delete_profile():
         os.remove(filepath)
     return jsonify({"success": True})
 
+KEY = Fernet.generate_key()
+cipher = Fernet(KEY)
+print(f"[INFO] Создался ключ")
 # ---------- Пароли ----------
+def save_passwords(data):
+    with open(PASSWORD_FILE, 'wb') as f:
+        jsons = json.dumps(data)
+        bytes_data = jsons.encode()
+        encrypted_data = cipher.encrypt(bytes_data)
+        f.write(encrypted_data)
+
 def load_passwords():
     if os.path.exists(PASSWORD_FILE):
-        with open(PASSWORD_FILE, 'r') as f:
-            return json.load(f)
+        with open(PASSWORD_FILE, 'rb') as f:
+            encrypted_data = f.read()
+            bytes_data = cipher.decrypt(encrypted_data)
+            jsons = bytes_data.decode()
+            return json.loads(jsons)
     return {}
-
-def save_passwords(data):
-    with open(PASSWORD_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
 
 @app.route('/api/passwords/get', methods=['POST'])
 def get_passwords():
@@ -499,7 +694,7 @@ def save_tabs():
         json.dump(data, f, ensure_ascii=False, indent=2)
     return jsonify({"success": True})
 
-# ---------- ПОИСК И ГЕНЕРАЦИЯ С КОНТЕКСТОМ ----------
+# ---------- ПОИСК ----------
 def search_ddgs(query, max_results=14):
     try:
         with DDGS() as ddgs:
@@ -531,10 +726,18 @@ def get_cached(query):
 def set_cache(query, data):
     CACHE[query] = (data, time.time())
 
+def protection(text):
+    if not text:
+        return ""
+    import re
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'[\'";]', '', text)
+    return text[:1000]
+
 @app.route('/api/combined', methods=['POST'])
 def combined():
     data = request.get_json()
-    query = data.get('query', '').strip()
+    query = protection(data.get('query', ''))
     lang = data.get('lang', 'ru')
     if not query:
         return jsonify({'search_results': [], 'ai_answer': None})
@@ -546,10 +749,8 @@ def combined():
         else:
             return jsonify({'search_results': cached, 'ai_answer': None})
 
-    # Поиск через DuckDuckGo
     results = search_ddgs(query, max_results=14)
 
-    # Если результатов нет – пасхалка
     if not results:
         lower = query.lower()
         keywords = ['кыргызстан', 'бишкек', 'манас', 'ош', 'иссык-куль', 'кыргыз']
@@ -562,19 +763,28 @@ def combined():
                 })
                 break
 
-    # Формируем контекст из первых 5 сниппетов
     context = ""
     if results:
         snippets = [r.get('snippet', '') for r in results[:5] if r.get('snippet')]
         if snippets:
             context = "Информация из поиска:\n" + "\n".join(snippets)
 
-    # Генерация ИИ-ответа с использованием контекста
-    ai_answer = generate_ai_answer(query, lang, context)
+    ai_answer = generate_gpt2_reply(query)
 
     set_cache(query, (results, ai_answer))
     return jsonify({'search_results': results, 'ai_answer': ai_answer})
 
+# ---------- ЧАТ С GPT-2 ----------
+@app.route('/api/chat', methods=['POST'])
+def chat_gpt2():
+    data = request.get_json()
+    user_text = data.get('message', '').strip()
+    if not user_text:
+        return jsonify({'reply': 'Пожалуйста, введите сообщение.'})
+    reply = generate_gpt2_reply(user_text)
+    return jsonify({'reply': reply})
+
+# ---------- ПЕРЕВОД ----------
 @app.route('/api/translate', methods=['POST'])
 def translate_text():
     data = request.get_json()
@@ -600,15 +810,11 @@ def index():
 def profile():
     return send_from_directory(STATIC_DIR, 'profile.html')
 
-# ---------- ЗАПУСК FLASK ----------
-def run_flask():
-    try:
-        print(f"Запуск Flask на порту {PORT}...")
-        app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False)
-    except Exception as e:
-        print(f"Ошибка Flask: {e}")
+# ================================================================
+#  ВИДЖЕТЫ Qt (Профиль, Инструменты, Настройки)
+# ================================================================
 
-# ---------- МОНИТОР (для инструментов) ----------
+# ---------- МОНИТОР ----------
 class MonitorWorker(QThread):
     update_signal = pyqtSignal(str, str)
 
@@ -622,6 +828,7 @@ class MonitorWorker(QThread):
     def run(self):
         while self.running:
             try:
+                import requests
                 resp = requests.get(self.url, timeout=15)
                 if resp.status_code == 200:
                     soup = BeautifulSoup(resp.text, 'html.parser')
@@ -668,7 +875,7 @@ class MonitorManager:
             return True, "Мониторинг остановлен"
         return False, "Мониторинг для этого URL не найден"
 
-# ---------- ВИДЖЕТ ИНСТРУМЕНТОВ ----------
+# ---------- ИНСТРУМЕНТЫ ----------
 class ToolsWidget(QWidget):
     def __init__(self, parent=None, browser_window=None):
         super().__init__(parent)
@@ -677,7 +884,6 @@ class ToolsWidget(QWidget):
         self.current_monitor_url = None
 
         layout = QVBoxLayout(self)
-
         self.output_area = QTextEdit()
         self.output_area.setReadOnly(True)
         self.output_area.setFont(QFont("Segoe UI", 10))
@@ -694,7 +900,6 @@ class ToolsWidget(QWidget):
         btn_layout.addWidget(self.btn_stop_monitor)
 
         layout.addLayout(btn_layout)
-
         self.append_message("📢", "Мониторинг страниц. Нажмите «Следить» для текущей вкладки.")
 
     def append_message(self, sender, msg):
@@ -754,7 +959,7 @@ class ToolsWidget(QWidget):
                 self.current_monitor_url = None
                 self.btn_stop_monitor.setEnabled(False)
 
-# ---------- ВИДЖЕТ ПРОФИЛЯ ----------
+# ---------- ПРОФИЛЬ (вкладка) ----------
 class ProfileWidget(QWidget):
     def __init__(self, parent=None, browser_window=None):
         super().__init__(parent)
@@ -880,6 +1085,7 @@ class ProfileWidget(QWidget):
 
     def _set_bg(self, bg_type, value):
         try:
+            import requests
             requests.post('http://127.0.0.1:5000/api/backgrounds/set',
                           json={'type': bg_type, 'value': value})
             if self.browser_window:
@@ -892,6 +1098,7 @@ class ProfileWidget(QWidget):
 
     def refresh_widget_list(self):
         try:
+            import requests
             resp = requests.get('http://127.0.0.1:5000/api/widgets/get')
             if resp.status_code == 200:
                 widgets = resp.json()
@@ -916,6 +1123,7 @@ class ProfileWidget(QWidget):
             icon = "🌐"
 
         try:
+            import requests
             resp = requests.get('http://127.0.0.1:5000/api/widgets/get')
             if resp.status_code != 200:
                 QMessageBox.warning(self, "Ошибка", "Не удалось получить виджеты")
@@ -943,6 +1151,7 @@ class ProfileWidget(QWidget):
             index = int(index_str) - 1
             if index < 0:
                 raise ValueError
+            import requests
             resp = requests.get('http://127.0.0.1:5000/api/widgets/get')
             if resp.status_code != 200:
                 QMessageBox.warning(self, "Ошибка", "Не удалось получить виджеты")
@@ -985,181 +1194,11 @@ class ProfileWidget(QWidget):
             self.browser_window.apply_theme(theme)
         QMessageBox.information(self, "Настройки", "Настройки сохранены и применены.")
 
-# ---------- КЛАСС КИНОТЕАТРА ----------
-class CinemaWindow(QWidget):
-    def __init__(self, video_url, brightness=0.7, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("🎥 3D Кинотеатр")
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setGeometry(100, 100, 1200, 700)
-
-        self.brightness = brightness
-        self.ambient_enabled = True
-        self.current_color = QColor(30, 30, 30)
-        self.timer_interval = 150
-
-        self.background_widget = QWidget(self)
-        self.background_widget.setGeometry(0, 0, self.width(), self.height())
-        self.background_widget.setStyleSheet("background-color: rgba(0,0,0,0.85);")
-
-        self.web_view = QWebEngineView(self.background_widget)
-        self.web_view.setGeometry(80, 50, self.width()-160, self.height()-120)
-
-        settings = self.web_view.settings()
-        settings.setAttribute(settings.WebAttribute.JavascriptEnabled, True)
-        settings.setAttribute(settings.WebAttribute.LocalStorageEnabled, True)
-
-        self.video_url = video_url
-        self.web_view.setUrl(QUrl(video_url))
-
-        self.control_panel = QWidget(self.background_widget)
-        self.control_panel.setStyleSheet("background: rgba(0,0,0,0.4); border-radius: 15px;")
-        self.control_panel.setGeometry(20, self.height()-70, self.width()-40, 50)
-
-        self.close_btn = QPushButton("✕", self.control_panel)
-        self.close_btn.setStyleSheet("background: #e74c3c; color: white; border: none; border-radius: 15px; font-size: 16px; padding: 6px 14px;")
-        self.close_btn.clicked.connect(self.close)
-        self.close_btn.setGeometry(10, 10, 40, 30)
-
-        self.fullscreen_btn = QPushButton("⛶", self.control_panel)
-        self.fullscreen_btn.setStyleSheet("background: #2ecc71; color: white; border: none; border-radius: 15px; font-size: 16px; padding: 6px 14px;")
-        self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
-        self.fullscreen_btn.setGeometry(60, 10, 40, 30)
-
-        self.brightness_label = QLabel("💡", self.control_panel)
-        self.brightness_label.setStyleSheet("color: white; font-size: 16px;")
-        self.brightness_label.setGeometry(120, 12, 30, 30)
-
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal, self.control_panel)
-        self.brightness_slider.setRange(10, 100)
-        self.brightness_slider.setValue(int(self.brightness * 100))
-        self.brightness_slider.setStyleSheet("QSlider::groove:horizontal { height: 4px; background: #6effaa; } QSlider::handle:horizontal { width: 14px; height: 14px; background: #6effaa; border-radius: 7px; }")
-        self.brightness_slider.setGeometry(160, 15, 120, 20)
-        self.brightness_slider.valueChanged.connect(self.on_brightness_changed)
-
-        self.ambient_check = QCheckBox("Ambient", self.control_panel)
-        self.ambient_check.setStyleSheet("color: white; font-size: 12px;")
-        self.ambient_check.setChecked(True)
-        self.ambient_check.setGeometry(300, 10, 80, 30)
-        self.ambient_check.stateChanged.connect(self.on_ambient_toggle)
-
-        self.pip_btn = QPushButton("📺 PiP", self.control_panel)
-        self.pip_btn.setStyleSheet("background: #3498db; color: white; border: none; border-radius: 15px; font-size: 14px; padding: 4px 12px;")
-        self.pip_btn.clicked.connect(self.open_pip_mode)
-        self.pip_btn.setGeometry(400, 10, 60, 30)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_ambient_light)
-        self.timer.start(self.timer_interval)
-
-        self.is_fullscreen = False
-        self.drag_pos = None
-
-    def resizeEvent(self, event):
-        w = self.width()
-        h = self.height()
-        self.background_widget.setGeometry(0, 0, w, h)
-        self.web_view.setGeometry(80, 50, w-160, h-120)
-        self.control_panel.setGeometry(20, h-70, w-40, 50)
-        super().resizeEvent(event)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_pos = event.globalPosition().toPoint()
-
-    def mouseMoveEvent(self, event):
-        if self.drag_pos is not None:
-            delta = event.globalPosition().toPoint() - self.drag_pos
-            self.move(self.pos() + delta)
-            self.drag_pos = event.globalPosition().toPoint()
-
-    def mouseReleaseEvent(self, event):
-        self.drag_pos = None
-
-    def on_brightness_changed(self, value):
-        self.brightness = value / 100.0
-
-    def on_ambient_toggle(self, state):
-        self.ambient_enabled = (state == Qt.CheckState.Checked)
-
-    def toggle_fullscreen(self):
-        if self.is_fullscreen:
-            self.showNormal()
-            self.is_fullscreen = False
-            self.fullscreen_btn.setText("⛶")
-        else:
-            self.showFullScreen()
-            self.is_fullscreen = True
-            self.fullscreen_btn.setText("⛶")
-
-    def open_pip_mode(self):
-        if self.parent():
-            if hasattr(self.parent(), 'open_pip_simple'):
-                self.parent().open_pip_simple(self.video_url)
-        self.close()
-
-    def update_ambient_light(self):
-        if not self.ambient_enabled:
-            return
-        js_code = """
-        (function() {
-            var video = document.querySelector('video');
-            if (!video) return null;
-            var canvas = document.createElement('canvas');
-            canvas.width = 16;
-            canvas.height = 16;
-            var ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0, 16, 16);
-            var imageData = ctx.getImageData(0, 0, 16, 16);
-            var data = imageData.data;
-            var r=0, g=0, b=0, count=0;
-            for (var i=0; i<data.length; i+=4) {
-                r += data[i];
-                g += data[i+1];
-                b += data[i+2];
-                count++;
-            }
-            return [Math.floor(r/count), Math.floor(g/count), Math.floor(b/count)];
-        })();
-        """
-        self.web_view.page().runJavaScript(js_code, self.on_color_received)
-
-    def on_color_received(self, result):
-        if result is None:
-            return
-        try:
-            r, g, b = result
-            r = int(r * self.brightness)
-            g = int(g * self.brightness)
-            b = int(b * self.brightness)
-            color = QColor(r, g, b)
-            self.current_color = color
-            self.update_background_gradient(color)
-        except Exception:
-            pass
-
-    def update_background_gradient(self, color):
-        grad = QRadialGradient(self.width()/2, self.height()/2, max(self.width(), self.height())*0.8)
-        grad.setColorAt(0, color)
-        grad.setColorAt(0.6, color.darker(120))
-        grad.setColorAt(1, QColor(0, 0, 0))
-
-        palette = self.background_widget.palette()
-        palette.setBrush(QPalette.ColorRole.Window, QBrush(grad))
-        self.background_widget.setPalette(palette)
-        self.background_widget.setAutoFillBackground(True)
-
-    def closeEvent(self, event):
-        self.timer.stop()
-        super().closeEvent(event)
-
 # ================================================================
-#  iOS-ПЕРЕКЛЮЧАТЕЛЬ
+#  iOS-ПЕРЕКЛЮЧАТЕЛЬ (IOSToggle)
 # ================================================================
 class IOSToggle(QPushButton):
     toggled = pyqtSignal(bool)
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self._checked = False
@@ -1167,16 +1206,13 @@ class IOSToggle(QPushButton):
         self.setCheckable(False)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clicked.connect(self._toggle)
-
         self.anim = QPropertyAnimation(self, b"pos")
         self.anim.setDuration(200)
         self.anim.setEasingCurve(QEasingCurve.Type.OutQuad)
-
         self.off_color = QColor(120, 120, 128)
         self.on_color = QColor(52, 199, 89)
         self.thumb_color = QColor(255, 255, 255)
         self.thumb_radius = 12
-
         self.setStyleSheet("background: transparent; border: none;")
         self.update()
 
@@ -1228,14 +1264,17 @@ class BrowserWindow(QMainWindow):
         self.setWindowTitle("FreeSearch")
         icon_path = resource_path("freesearch.jpeg")
         self.setWindowIcon(QIcon(icon_path))
-
-        self.setGeometry(100, 100, 1200, 800)
+        screen = self.setGeometry(100, 100, 1200, 800)
 
         font = QFont("Segoe UI", 9)
         QApplication.setFont(font)
 
         self.settings = load_settings()
         self.apply_theme(self.settings.get("theme", "dark"))
+
+        # Safe Browsing
+        self.safe_browsing_api_key = "AIzaSyCxIKEwIyckbHKQS4nrKQ1MMizJDyrRrxM"  # ЗАМЕНИТЕ НА РЕАЛЬНЫЙ КЛЮЧ
+        self.safe_browsing = SafeBrowsingChecker(self.safe_browsing_api_key, self)
 
         # ByeDPI
         self.byedpi_process = None
@@ -1257,6 +1296,9 @@ class BrowserWindow(QMainWindow):
 
         self.update_proxy_ui(False)
 
+        # Консоль логов (Ctrl+F)
+        self.console = None
+
     def create_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1271,6 +1313,7 @@ class BrowserWindow(QMainWindow):
         nav_layout.setContentsMargins(15, 10, 15, 10)
         nav_layout.setSpacing(8)
 
+        # Кнопки навигации (видео-плеер удалён)
         self.btn_back = QPushButton("⬅️")
         self.btn_back.setToolTip("Назад")
         self.btn_back.clicked.connect(self.go_back)
@@ -1296,16 +1339,12 @@ class BrowserWindow(QMainWindow):
         self.btn_new_tab.setToolTip("Новая вкладка")
         self.btn_new_tab.clicked.connect(lambda: self.add_new_tab(HOME_URL))
 
-        self.btn_cinema = QPushButton("🎬 3D Кино")
-        self.btn_cinema.setToolTip("Открыть текущее видео в 3D-кинотеатре")
-        self.btn_cinema.clicked.connect(self.open_cinema)
-
-        # iOS-тумблер
+        # ByeDPI тумблер
         self.byedpi_toggle = IOSToggle()
         self.byedpi_toggle.setToolTip("Включить/выключить обход блокировок через ByeDPI")
         self.byedpi_toggle.toggled.connect(self.toggle_byedpi)
 
-        self.label_proxy = QLabel("🔒 Прокси")
+        self.label_proxy = QLabel("🔒")
         self.label_proxy.setStyleSheet("font-size: 10pt; font-weight: normal;")
 
         proxy_container = QWidget()
@@ -1320,7 +1359,7 @@ class BrowserWindow(QMainWindow):
         self.url_bar.setPlaceholderText("🔍 Введите URL или поисковый запрос")
         self.url_bar.returnPressed.connect(self.navigate_to_url)
 
-        # Кнопки для скачивания
+        # Кнопки скачивания
         self.btn_download = QPushButton("⬇️ Скачать сайт")
         self.btn_download.setToolTip("Сохранить текущую страницу со всеми ресурсами")
         self.btn_download.clicked.connect(self.download_site)
@@ -1335,7 +1374,6 @@ class BrowserWindow(QMainWindow):
         nav_layout.addWidget(self.btn_profile)
         nav_layout.addWidget(self.btn_tabs)
         nav_layout.addWidget(self.btn_new_tab)
-        nav_layout.addWidget(self.btn_cinema)
         nav_layout.addWidget(self.btn_download)
         nav_layout.addWidget(self.btn_load)
         nav_layout.addWidget(proxy_container)
@@ -1345,7 +1383,6 @@ class BrowserWindow(QMainWindow):
         self.tab_widget.setDocumentMode(True)
         self.tab_widget.tabBar().setVisible(False)
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
-
         main_layout.addWidget(nav_bar)
         main_layout.addWidget(self.tab_widget, 1)
 
@@ -1355,15 +1392,8 @@ class BrowserWindow(QMainWindow):
         # Профиль веб-движка
         web_profile_path = os.path.join(SAVE_DIR, "webprofile")
         os.makedirs(web_profile_path, exist_ok=True)
-        test_file = os.path.join(web_profile_path, "_test.txt")
-        with open(test_file, 'w') as f:
-            f.write("profile folder is writable")
-        print(f"✅ ПРОФИЛЬ СОЗДАН: {web_profile_path}")
-        print(f"   Тестовый файл: {test_file}")
-
         self.profile = QWebEngineProfile("freesearch", self)
         self.profile.setPersistentStoragePath(web_profile_path)
-
         try:
             self.profile.setPasswordStoreEnabled(True)
         except AttributeError:
@@ -1375,6 +1405,11 @@ class BrowserWindow(QMainWindow):
         except AttributeError:
             pass
 
+        # Блокировщик рекламы
+        self.adblock_interceptor = AdBlockInterceptor()
+        self.profile.setUrlRequestInterceptor(self.adblock_interceptor)
+
+        # Скрипт для обхода Rutube
         js_code = """
         (function() {
             window.PRMCDN_DISABLED = true;
@@ -1388,106 +1423,276 @@ class BrowserWindow(QMainWindow):
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
         self.profile.scripts().insert(script)
-        print("✅ Скрипт для обхода блокировок Rutube добавлен")
 
+        # Создаём первую вкладку с Safe Browsing
         self.add_new_tab(HOME_URL)
         self.update_tabs_menu()
         self.update_status("Готово")
 
-    # ---- ByeDPI ----
-    def toggle_byedpi(self, state):
-        if not self.ciadpi_exists:
-            self.byedpi_toggle.set_checked(False, animate=False)
-            return
-        if state:
-            self.enable_byedpi()
-        else:
-            self.disable_byedpi()
+    def add_new_tab(self, url=None):
+        web_view = QWebEngineView()
+        page = SafeBrowsingWebEnginePage(self.profile, self, web_view)
+        web_view.setPage(page)
+        web_view.setUrl(QUrl(url or HOME_URL))
+        web_view.urlChanged.connect(lambda qurl, wv=web_view: self.on_url_changed(wv, qurl))
+        web_view.loadFinished.connect(lambda ok, wv=web_view: self.on_load_finished(wv))
+        settings = web_view.settings()
+        settings.setAttribute(settings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(settings.WebAttribute.AutoLoadImages, True)
+        settings.setAttribute(settings.WebAttribute.ErrorPageEnabled, False)
+        settings.setAttribute(settings.WebAttribute.PluginsEnabled, False)
+        settings.setAttribute(settings.WebAttribute.LocalStorageEnabled, True)
 
-    def enable_byedpi(self):
-        if self.byedpi_process is not None and self.byedpi_process.poll() is None:
+        index = self.tab_widget.addTab(web_view, "Новая вкладка")
+        self.tab_widget.setCurrentIndex(index)
+        self.update_tabs_menu()
+        self.save_tabs_state()
+        return web_view
+
+    # ---------- НАВИГАЦИЯ ----------
+    def go_back(self):
+        wv = self.get_current_web_view()
+        if wv and wv.history().canGoBack():
+            wv.back()
+        else:
+            for i in range(self.tab_widget.count()):
+                widget = self.tab_widget.widget(i)
+                if isinstance(widget, QWebEngineView) and widget.history().canGoBack():
+                    self.tab_widget.setCurrentIndex(i)
+                    widget.back()
+                    return
+
+    def go_forward(self):
+        wv = self.get_current_web_view()
+        if wv and wv.history().canGoForward():
+            wv.forward()
+        else:
+            for i in range(self.tab_widget.count()):
+                widget = self.tab_widget.widget(i)
+                if isinstance(widget, QWebEngineView) and widget.history().canGoForward():
+                    self.tab_widget.setCurrentIndex(i)
+                    widget.forward()
+                    return
+
+    def go_home(self):
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if isinstance(widget, QWebEngineView):
+                self.tab_widget.setCurrentIndex(i)
+                widget.setUrl(QUrl(HOME_URL))
+                return
+        self.add_new_tab(HOME_URL)
+
+    def load_url(self, url):
+        wv = self.get_current_web_view()
+        if wv:
+            wv.setUrl(QUrl(url))
+        else:
+            self.add_new_tab(url)
+
+    def navigate_to_url(self):
+        text = self.url_bar.text().strip()
+        if not text:
             return
+        if not text.startswith(("http://", "https://")):
+            if "." in text and " " not in text:
+                text = "https://" + text
+            else:
+                search_url = f"https://duckduckgo.com/?q={text.replace(' ', '+')}"
+                self.load_url(search_url)
+                return
+        self.load_url(text)
+
+    def update_nav_buttons(self, web_view):
+        if web_view:
+            self.btn_back.setEnabled(web_view.history().canGoBack())
+            self.btn_forward.setEnabled(web_view.history().canGoForward())
+
+    def reload_current_tab(self):
+        wv = self.get_current_web_view()
+        if wv:
+            wv.reload()
+            self.statusBar().showMessage("Страница перезагружена")
+
+    # ---------- ВКЛАДКИ ----------
+    def load_tabs_state(self):
         try:
-            self.byedpi_process = subprocess.Popen(
-                [self.ciadpi_path, "-i", "127.0.0.1", "-p", "1080", "-r", "1", "-e", "1"],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            import requests
+            resp = requests.get('http://127.0.0.1:5000/api/tabs/get', timeout=1)
+            if resp.status_code == 200:
+                data = resp.json()
+                tabs = data.get('tabs', [])
+                current_index = data.get('current_index', 0)
+                if tabs:
+                    while self.tab_widget.count() > 0:
+                        self.tab_widget.removeTab(0)
+                    for tab in tabs:
+                        url = tab.get('url', HOME_URL)
+                        self.add_new_tab(url)
+                    if current_index < self.tab_widget.count():
+                        self.tab_widget.setCurrentIndex(current_index)
+                    else:
+                        self.tab_widget.setCurrentIndex(0)
+                    self.update_tabs_menu()
+                    return
         except Exception as e:
-            self.statusBar().showMessage(f"❌ Ошибка запуска ciadpi: {e}")
-            self.update_proxy_ui(False)
-            return
+            print(f"Ошибка загрузки вкладок: {e}")
+        if self.tab_widget.count() == 0:
+            self.add_new_tab(HOME_URL)
 
-        time.sleep(0.5)
-        if self.byedpi_process.poll() is not None:
-            self.statusBar().showMessage("❌ ciadpi.exe завершился сразу после запуска")
-            self.update_proxy_ui(False)
-            self.byedpi_process = None
-            return
+    def save_tabs_state(self):
+        tabs_data = []
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if isinstance(widget, QWebEngineView):
+                url = widget.url().toString()
+                tabs_data.append({"url": url})
+        current_index = self.tab_widget.currentIndex()
+        try:
+            import requests
+            requests.post('http://127.0.0.1:5000/api/tabs/save',
+                          json={"tabs": tabs_data, "current_index": current_index},
+                          timeout=1)
+        except Exception as e:
+            print(f"Ошибка сохранения вкладок: {e}")
 
-        self.set_proxy(True)
-        self.byedpi_enabled = True
-        self.update_proxy_ui(True)
-        self.statusBar().showMessage("✅ ByeDPI включён, прокси SOCKS5 127.0.0.1:1080")
-        self.reload_current_tab()
+    def get_current_web_view(self):
+        widget = self.tab_widget.currentWidget()
+        if isinstance(widget, QWebEngineView):
+            return widget
+        return None
 
-    def disable_byedpi(self):
-        if self.byedpi_process is not None:
-            try:
-                self.byedpi_process.terminate()
-                try:
-                    self.byedpi_process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self.byedpi_process.kill()
-                    self.byedpi_process.wait()
-            except Exception:
-                pass
-            self.byedpi_process = None
+    def on_tab_changed(self, index):
+        if index >= 0:
+            widget = self.tab_widget.widget(index)
+            if isinstance(widget, QWebEngineView):
+                self.url_bar.setText(widget.url().toString())
+                self.update_nav_buttons(widget)
+            self.save_tabs_state()
 
-        self.set_proxy(False)
-        self.byedpi_enabled = False
-        self.update_proxy_ui(False)
-        self.statusBar().showMessage("⛔ ByeDPI выключен, прямое соединение")
-        self.reload_current_tab()
+    def on_url_changed(self, web_view, qurl):
+        if web_view == self.get_current_web_view():
+            self.url_bar.setText(qurl.toString())
+            title = web_view.page().title() or "Новая вкладка"
+            index = self.tab_widget.indexOf(web_view)
+            if index >= 0:
+                self.tab_widget.setTabText(index, title)
+                self.update_tabs_menu()
 
-    def set_proxy(self, enable):
-        if enable:
-            proxy = QNetworkProxy()
-            proxy.setType(QNetworkProxy.ProxyType.Socks5Proxy)
-            proxy.setHostName("127.0.0.1")
-            proxy.setPort(1080)
-            QNetworkProxy.setApplicationProxy(proxy)
-            print("Сеть перенаправлена на ByeDPI")
+    def on_load_finished(self, web_view):
+        if web_view == self.get_current_web_view():
+            self.update_nav_buttons(web_view)
+        title = web_view.page().title() or "Новая вкладка"
+        index = self.tab_widget.indexOf(web_view)
+        if index >= 0:
+            self.tab_widget.setTabText(index, title)
+            self.update_tabs_menu()
+
+    def close_current_tab(self):
+        if self.tab_widget.count() <= 1:
+            self.add_new_tab(HOME_URL)
         else:
-            QNetworkProxy.setApplicationProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
-            print("Сеть возвращена в исходный режим")
+            current = self.tab_widget.currentIndex()
+            self.tab_widget.removeTab(current)
+            self.update_tabs_menu()
+            self.save_tabs_state()
 
-    def cleanup_byedpi(self):
-        if self.byedpi_process is not None:
-            try:
-                self.byedpi_process.terminate()
-                try:
-                    self.byedpi_process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self.byedpi_process.kill()
-                    self.byedpi_process.wait()
-            except Exception:
-                pass
-            self.byedpi_process = None
-            self.byedpi_enabled = False
-            self.set_proxy(False)
+    def switch_to_tab(self, index):
+        if 0 <= index < self.tab_widget.count():
+            self.tab_widget.setCurrentIndex(index)
+            self.update_tabs_menu()
 
-    def update_proxy_ui(self, enabled):
-        self.byedpi_toggle.set_checked(enabled, animate=True)
-        if enabled:
-            self.label_proxy.setText("🔓 Прокси Вкл")
-            self.label_proxy.setStyleSheet("color: #6effaa; font-weight: bold; font-size: 10pt;")
+    def update_tabs_menu(self):
+        self.tabs_menu.clear()
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if isinstance(widget, QWebEngineView):
+                title = widget.page().title() or f"Вкладка {i+1}"
+            elif isinstance(widget, ProfileWidget):
+                title = "👤 Профиль"
+            else:
+                title = "Вкладка"
+            if len(title) > 40:
+                title = title[:40] + "..."
+            action = QAction(title, self)
+            action.setData(i)
+            action.triggered.connect(lambda checked, idx=i: self.switch_to_tab(idx))
+            self.tabs_menu.addAction(action)
+
+        self.tabs_menu.addSeparator()
+        new_tab_action = QAction("➕ Новая вкладка", self)
+        new_tab_action.triggered.connect(lambda: self.add_new_tab(HOME_URL))
+        self.tabs_menu.addAction(new_tab_action)
+
+        close_tab_action = QAction("❌ Закрыть вкладку", self)
+        close_tab_action.triggered.connect(self.close_current_tab)
+        self.tabs_menu.addAction(close_tab_action)
+
+    def show_tabs_menu(self):
+        pass
+
+    def update_status(self, msg):
+        self.statusBar().showMessage(msg)
+
+    # ---------- ПРОФИЛЬ ----------
+    def open_profile_tab(self):
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if isinstance(widget, ProfileWidget):
+                self.tab_widget.setCurrentIndex(i)
+                return
+        profile_widget = ProfileWidget(self, self)
+        index = self.tab_widget.addTab(profile_widget, "👤 Профиль")
+        self.tab_widget.setCurrentIndex(index)
+
+    # ---------- ТЕМА ----------
+    def apply_theme(self, theme):
+        if theme == "light":
+            bg = "#f0f4f8"
+            text = "#1a202c"
+            accent = "#2b6cb0"
+            input_bg = "#ffffff"
+            input_border = "#a0aec0"
+        elif theme == "dark":
+            bg = "#0a0f14"
+            text = "#eef2ff"
+            accent = "#6effaa"
+            input_bg = "#1e2936"
+            input_border = "#6effaa"
         else:
-            self.label_proxy.setText("🔒 Прокси")
-            self.label_proxy.setStyleSheet("color: inherit; font-weight: normal; font-size: 10pt;")
+            bg = "#0a0f14"
+            text = "#eef2ff"
+            accent = "#6effaa"
+            input_bg = "#1e2936"
+            input_border = "#6effaa"
 
-    # ---- Скачивание и открытие сайтов ----
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {bg}; }}
+            QWidget {{ background-color: {bg}; color: {text}; font-family: 'Segoe UI'; font-size: 9pt; }}
+            QPushButton {{
+                background: transparent; border: none; color: {accent};
+                font-size: 16px; padding: 8px 14px; border-radius: 20px; font-weight: 600;
+            }}
+            QPushButton:hover {{ background: rgba(110, 255, 170, 0.15); color: #aaffcc; }}
+            QLineEdit {{
+                background: {input_bg}; border: 1px solid {input_border};
+                border-radius: 30px; padding: 8px 20px; color: {text}; font-size: 14px;
+                selection-background-color: {accent};
+            }}
+            QLineEdit:focus {{ border: 1px solid {accent}; background: {input_bg}; }}
+            QTabWidget::pane {{ border: none; background: {bg}; }}
+            QMenu {{ background-color: {input_bg}; color: {text}; border: 1px solid {accent}; border-radius: 12px; }}
+            QMenu::item {{ padding: 8px 20px; border-radius: 8px; }}
+            QMenu::item:selected {{ background: rgba(110, 255, 170, 0.2); }}
+            QStatusBar {{ background-color: {bg}; color: {text}; border-top: 1px solid {accent}; padding: 5px; }}
+            QWidget#navBar {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                            stop:0 #0f1724, stop:1 #1a2a3a);
+                border-bottom: 2px solid {accent};
+            }}
+        """)
+
+    # ---------- СКАЧИВАНИЕ САЙТОВ ----------
     def open_downloaded_sites(self):
         if not os.path.exists(LOAD_DIR) or not os.listdir(LOAD_DIR):
             QMessageBox.information(self, "Скачанные сайты", "Нет скачанных сайтов.")
@@ -1582,6 +1787,7 @@ class BrowserWindow(QMainWindow):
                 else:
                     continue
                 try:
+                    import requests
                     resp = requests.get(full_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
                     if resp.status_code == 200:
                         with open(local_path, 'wb') as f:
@@ -1597,326 +1803,161 @@ class BrowserWindow(QMainWindow):
         with open(os.path.join(site_dir, "index.html"), 'w', encoding='utf-8') as f:
             f.write(str(soup))
 
-    # ---- Вкладки ----
-    def load_tabs_state(self):
+    # ---------- BYEDPI ----------
+    def toggle_byedpi(self, state):
+        if not self.ciadpi_exists:
+            self.byedpi_toggle.set_checked(False, animate=False)
+            return
+        if state:
+            self.enable_byedpi()
+        else:
+            self.disable_byedpi()
+
+    def enable_byedpi(self):
+        if self.byedpi_process is not None and self.byedpi_process.poll() is None:
+            return
         try:
-            resp = requests.get('http://127.0.0.1:5000/api/tabs/get', timeout=1)
-            if resp.status_code == 200:
-                data = resp.json()
-                tabs = data.get('tabs', [])
-                current_index = data.get('current_index', 0)
-                if tabs:
-                    while self.tab_widget.count() > 0:
-                        self.tab_widget.removeTab(0)
-                    for tab in tabs:
-                        url = tab.get('url', HOME_URL)
-                        self.add_new_tab(url)
-                    if current_index < self.tab_widget.count():
-                        self.tab_widget.setCurrentIndex(current_index)
-                    else:
-                        self.tab_widget.setCurrentIndex(0)
-                    self.update_tabs_menu()
-                    return
+            self.byedpi_process = subprocess.Popen(
+                [self.ciadpi_path, "-i", "127.0.0.1", "-p", "1080", "-r", "1", "-e", "1"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
         except Exception as e:
-            print(f"Ошибка загрузки вкладок: {e}")
-        if self.tab_widget.count() == 0:
-            self.add_new_tab(HOME_URL)
-
-    def save_tabs_state(self):
-        tabs_data = []
-        for i in range(self.tab_widget.count()):
-            widget = self.tab_widget.widget(i)
-            if isinstance(widget, QWebEngineView):
-                url = widget.url().toString()
-                tabs_data.append({"url": url})
-        current_index = self.tab_widget.currentIndex()
-        try:
-            requests.post('http://127.0.0.1:5000/api/tabs/save',
-                          json={"tabs": tabs_data, "current_index": current_index},
-                          timeout=1)
-        except Exception as e:
-            print(f"Ошибка сохранения вкладок: {e}")
-
-    def reload_current_tab(self):
-        wv = self.get_current_web_view()
-        if wv:
-            wv.reload()
-            self.statusBar().showMessage("Страница перезагружена")
-
-    def apply_theme(self, theme):
-        if theme == "light":
-            bg = "#f0f4f8"
-            text = "#1a202c"
-            accent = "#2b6cb0"
-            input_bg = "#ffffff"
-            input_border = "#a0aec0"
-        elif theme == "dark":
-            bg = "#0a0f14"
-            text = "#eef2ff"
-            accent = "#6effaa"
-            input_bg = "#1e2936"
-            input_border = "#6effaa"
-        else:
-            bg = "#0a0f14"
-            text = "#eef2ff"
-            accent = "#6effaa"
-            input_bg = "#1e2936"
-            input_border = "#6effaa"
-
-        self.setStyleSheet(f"""
-            QMainWindow {{ background-color: {bg}; }}
-            QWidget {{ background-color: {bg}; color: {text}; font-family: 'Segoe UI'; font-size: 9pt; }}
-            QPushButton {{
-                background: transparent; border: none; color: {accent};
-                font-size: 16px; padding: 8px 14px; border-radius: 20px; font-weight: 600;
-            }}
-            QPushButton:hover {{ background: rgba(110, 255, 170, 0.15); color: #aaffcc; }}
-            QLineEdit {{
-                background: {input_bg}; border: 1px solid {input_border};
-                border-radius: 30px; padding: 8px 20px; color: {text}; font-size: 14px;
-                selection-background-color: {accent};
-            }}
-            QLineEdit:focus {{ border: 1px solid {accent}; background: {input_bg}; }}
-            QTabWidget::pane {{ border: none; background: {bg}; }}
-            QMenu {{ background-color: {input_bg}; color: {text}; border: 1px solid {accent}; border-radius: 12px; }}
-            QMenu::item {{ padding: 8px 20px; border-radius: 8px; }}
-            QMenu::item:selected {{ background: rgba(110, 255, 170, 0.2); }}
-            QStatusBar {{ background-color: {bg}; color: {text}; border-top: 1px solid {accent}; padding: 5px; }}
-            QWidget#navBar {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                            stop:0 #0f1724, stop:1 #1a2a3a);
-                border-bottom: 2px solid {accent};
-            }}
-        """)
-
-    def open_cinema(self):
-        wv = self.get_current_web_view()
-        if not wv:
+            self.statusBar().showMessage(f"❌ Ошибка запуска ciadpi: {e}")
+            self.update_proxy_ui(False)
             return
-        url = wv.url().toString()
-        if 'youtube' in url or 'youtu.be' in url or 'rutube' in url or 'vk.com/video' in url:
-            video_url = url
-        else:
-            js = """
-            (function() {
-                var video = document.querySelector('video');
-                if (video && video.src) {
-                    return video.src;
-                }
-                var iframe = document.querySelector('iframe[src*="youtube"]') || document.querySelector('iframe[src*="rutube"]') || document.querySelector('iframe[src*="vk.com/video"]');
-                if (iframe) {
-                    return iframe.src;
-                }
-                return null;
-            })();
-            """
-            wv.page().runJavaScript(js, self.on_video_url_extracted)
+
+        time.sleep(0.5)
+        if self.byedpi_process.poll() is not None:
+            self.statusBar().showMessage("❌ ciadpi.exe завершился сразу после запуска")
+            self.update_proxy_ui(False)
+            self.byedpi_process = None
             return
-        self.open_cinema_window(video_url)
 
-    def on_video_url_extracted(self, result):
-        if result:
-            self.open_cinema_window(result)
+        self.set_proxy(True)
+        self.byedpi_enabled = True
+        self.update_proxy_ui(True)
+        self.statusBar().showMessage("✅ ByeDPI включён, прокси SOCKS5 127.0.0.1:1080")
+        self.reload_current_tab()
+
+    def disable_byedpi(self):
+        if self.byedpi_process is not None:
+            try:
+                self.byedpi_process.terminate()
+                try:
+                    self.byedpi_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.byedpi_process.kill()
+                    self.byedpi_process.wait()
+            except Exception:
+                pass
+            self.byedpi_process = None
+
+        self.set_proxy(False)
+        self.byedpi_enabled = False
+        self.update_proxy_ui(False)
+        self.statusBar().showMessage("⛔ ByeDPI выключен, прямое соединение")
+        self.reload_current_tab()
+
+    def set_proxy(self, enable):
+        if enable:
+            proxy = QNetworkProxy()
+            proxy.setType(QNetworkProxy.ProxyType.Socks5Proxy)
+            proxy.setHostName("127.0.0.1")
+            proxy.setPort(1080)
+            QNetworkProxy.setApplicationProxy(proxy)
+            print("Сеть перенаправлена на ByeDPI")
         else:
-            text, ok = QInputDialog.getText(self, "3D Кинотеатр", "Введите URL видео (YouTube, Rutube, VK):")
-            if ok and text:
-                self.open_cinema_window(text)
+            QNetworkProxy.setApplicationProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
+            print("Сеть возвращена в исходный режим")
 
-    def open_cinema_window(self, video_url):
-        if self.cinema_window is not None:
-            self.cinema_window.close()
-            self.cinema_window = None
-        self.cinema_window = CinemaWindow(video_url, brightness=0.7, parent=self)
-        self.cinema_window.show()
+    def cleanup_byedpi(self):
+        if self.byedpi_process is not None:
+            try:
+                self.byedpi_process.terminate()
+                try:
+                    self.byedpi_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.byedpi_process.kill()
+                    self.byedpi_process.wait()
+            except Exception:
+                pass
+            self.byedpi_process = None
+            self.byedpi_enabled = False
+            self.set_proxy(False)
 
-    def open_profile_tab(self):
-        for i in range(self.tab_widget.count()):
-            widget = self.tab_widget.widget(i)
-            if isinstance(widget, ProfileWidget):
-                self.tab_widget.setCurrentIndex(i)
-                return
-        profile_widget = ProfileWidget(self, self)
-        index = self.tab_widget.addTab(profile_widget, "👤 Профиль")
-        self.tab_widget.setCurrentIndex(index)
-
-    def add_new_tab(self, url=None):
-        web_view = QWebEngineView()
-        page = QWebEnginePage(self.profile, web_view)
-        web_view.setPage(page)
-        web_view.setUrl(QUrl(url or HOME_URL))
-        web_view.urlChanged.connect(lambda qurl, wv=web_view: self.on_url_changed(wv, qurl))
-        web_view.loadFinished.connect(lambda ok, wv=web_view: self.on_load_finished(wv))
-        settings = web_view.settings()
-        settings.setAttribute(settings.WebAttribute.JavascriptEnabled, True)
-        settings.setAttribute(settings.WebAttribute.AutoLoadImages, True)
-        settings.setAttribute(settings.WebAttribute.ErrorPageEnabled, False)
-        settings.setAttribute(settings.WebAttribute.PluginsEnabled, False)
-        settings.setAttribute(settings.WebAttribute.LocalStorageEnabled, True)
-        index = self.tab_widget.addTab(web_view, "Новая вкладка")
-        self.tab_widget.setCurrentIndex(index)
-        self.update_tabs_menu()
-        self.save_tabs_state()
-        return web_view
-
-    def close_current_tab(self):
-        if self.tab_widget.count() <= 1:
-            self.add_new_tab(HOME_URL)
+    def update_proxy_ui(self, enabled):
+        self.byedpi_toggle.set_checked(enabled, animate=True)
+        if enabled:
+            self.label_proxy.setText("🔓")
+            self.label_proxy.setStyleSheet("color: #6effaa; font-weight: bold; font-size: 10pt;")
         else:
-            current = self.tab_widget.currentIndex()
-            self.tab_widget.removeTab(current)
-            self.update_tabs_menu()
-            self.save_tabs_state()
+            self.label_proxy.setText("🔒")
+            self.label_proxy.setStyleSheet("color: inherit; font-weight: normal; font-size: 10pt;")
 
-    def switch_to_tab(self, index):
-        if 0 <= index < self.tab_widget.count():
-            self.tab_widget.setCurrentIndex(index)
-            self.update_tabs_menu()
-
-    def get_current_web_view(self):
-        widget = self.tab_widget.currentWidget()
-        if isinstance(widget, QWebEngineView):
-            return widget
-        return None
-
-    def on_tab_changed(self, index):
-        if index >= 0:
-            widget = self.tab_widget.widget(index)
-            if isinstance(widget, QWebEngineView):
-                self.url_bar.setText(widget.url().toString())
-                self.update_nav_buttons(widget)
-            self.save_tabs_state()
-
-    def on_url_changed(self, web_view, qurl):
-        if web_view == self.get_current_web_view():
-            self.url_bar.setText(qurl.toString())
-            title = web_view.page().title() or "Новая вкладка"
-            index = self.tab_widget.indexOf(web_view)
-            if index >= 0:
-                self.tab_widget.setTabText(index, title)
-                self.update_tabs_menu()
-
-    def on_load_finished(self, web_view):
-        if web_view == self.get_current_web_view():
-            self.update_nav_buttons(web_view)
-        title = web_view.page().title() or "Новая вкладка"
-        index = self.tab_widget.indexOf(web_view)
-        if index >= 0:
-            self.tab_widget.setTabText(index, title)
-            self.update_tabs_menu()
-
-    def go_back(self):
-        wv = self.get_current_web_view()
-        if wv and wv.history().canGoBack():
-            wv.back()
+    # ---------- КОНСОЛЬ ЛОГОВ (Ctrl+F) ----------
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_F and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            if self.console is None:
+                self.console = QWidget()
+                self.console.setWindowTitle("📋 Консоль логов")
+                self.console.setGeometry(200, 200, 800, 500)
+                self.console.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
+                layout = QVBoxLayout(self.console)
+                self.console_text = QTextEdit()
+                self.console_text.setReadOnly(True)
+                self.console_text.setFont(QFont("Courier New", 10))
+                layout.addWidget(self.console_text)
+                clear_btn = QPushButton("Очистить")
+                clear_btn.clicked.connect(self.console_text.clear)
+                layout.addWidget(clear_btn)
+                self.console_text.append("<b>Консоль логов запущена. Логи будут собираться...</b>")
+            self.console.show()
+            self.console.raise_()
+            event.accept()
         else:
-            for i in range(self.tab_widget.count()):
-                widget = self.tab_widget.widget(i)
-                if isinstance(widget, QWebEngineView) and widget.history().canGoBack():
-                    self.tab_widget.setCurrentIndex(i)
-                    widget.back()
-                    return
+            super().keyPressEvent(event)
 
-    def go_forward(self):
-        wv = self.get_current_web_view()
-        if wv and wv.history().canGoForward():
-            wv.forward()
-        else:
-            for i in range(self.tab_widget.count()):
-                widget = self.tab_widget.widget(i)
-                if isinstance(widget, QWebEngineView) and widget.history().canGoForward():
-                    self.tab_widget.setCurrentIndex(i)
-                    widget.forward()
-                    return
+    def append_log(self, message, level="INFO"):
+        if self.console is not None and hasattr(self, 'console_text'):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            color_map = {
+                "INFO": "#6effaa",
+                "WARN": "#feca57",
+                "ERROR": "#ff6b6b",
+                "DEBUG": "#54a0ff"
+            }
+            color = color_map.get(level, "#ffffff")
+            self.console_text.append(f'<span style="color:{color}">[{timestamp}] [{level}]</span> {message}')
 
-    def go_home(self):
-        for i in range(self.tab_widget.count()):
-            widget = self.tab_widget.widget(i)
-            if isinstance(widget, QWebEngineView):
-                self.tab_widget.setCurrentIndex(i)
-                widget.setUrl(QUrl(HOME_URL))
-                return
-        self.add_new_tab(HOME_URL)
-
-    def load_url(self, url):
-        wv = self.get_current_web_view()
-        if wv:
-            wv.setUrl(QUrl(url))
-        else:
-            self.add_new_tab(url)
-
-    def navigate_to_url(self):
-        text = self.url_bar.text().strip()
-        if not text:
-            return
-        if not text.startswith(("http://", "https://")):
-            if "." in text and " " not in text:
-                text = "https://" + text
-            else:
-                search_url = f"https://duckduckgo.com/?q={text.replace(' ', '+')}"
-                self.load_url(search_url)
-                return
-        self.load_url(text)
-
-    def update_nav_buttons(self, web_view):
-        if web_view:
-            self.btn_back.setEnabled(web_view.history().canGoBack())
-            self.btn_forward.setEnabled(web_view.history().canGoForward())
-
-    def update_tabs_menu(self):
-        self.tabs_menu.clear()
-        for i in range(self.tab_widget.count()):
-            widget = self.tab_widget.widget(i)
-            if isinstance(widget, QWebEngineView):
-                title = widget.page().title() or f"Вкладка {i+1}"
-            elif isinstance(widget, ProfileWidget):
-                title = "👤 Профиль"
-            else:
-                title = "Вкладка"
-            if len(title) > 40:
-                title = title[:40] + "..."
-            action = QAction(title, self)
-            action.setData(i)
-            action.triggered.connect(lambda checked, idx=i: self.switch_to_tab(idx))
-            self.tabs_menu.addAction(action)
-
-        self.tabs_menu.addSeparator()
-        new_tab_action = QAction("➕ Новая вкладка", self)
-        new_tab_action.triggered.connect(lambda: self.add_new_tab(HOME_URL))
-        self.tabs_menu.addAction(new_tab_action)
-
-        close_tab_action = QAction("❌ Закрыть вкладку", self)
-        close_tab_action.triggered.connect(self.close_current_tab)
-        self.tabs_menu.addAction(close_tab_action)
-
-    def show_tabs_menu(self):
-        pass
-
-    def update_status(self, msg):
-        self.statusBar().showMessage(msg)
-
+    # ---------- ЗАКРЫТИЕ ----------
     def closeEvent(self, event):
         self.cleanup_byedpi()
         self.save_tabs_state()
+        if self.console is not None:
+            self.console.close()
         super().closeEvent(event)
 
 # ================================================================
 #  ЗАПУСК
 # ================================================================
 if __name__ == '__main__':
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    ffmpeg_dir = os.path.join(base_dir, "venv", "Lib", "site-packages", "PyQt6", "Qt6", "bin")
-    if os.path.exists(os.path.join(ffmpeg_dir, "ffmpeg.dll")):
-        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-        print(f"[INFO] FFmpeg найден в {ffmpeg_dir}, путь добавлен в PATH")
-    else:
-        print(f"[WARNING] ffmpeg.dll не найден в {ffmpeg_dir}")
+    # Запуск Flask в отдельном потоке
+    def run_flask():
+        try:
+            app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False)
+        except Exception as e:
+            print(f"Ошибка Flask: {e}")
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("[LOG] Поток Flask запущен")
 
+    # Ждём готовности Flask
     for _ in range(30):
         try:
+            import requests
             requests.get(f'http://127.0.0.1:{PORT}', timeout=0.5)
             print("[LOG] Flask готов")
             break
@@ -1926,17 +1967,7 @@ if __name__ == '__main__':
         QMessageBox.critical(None, "Ошибка", "Не удалось запустить внутренний сервер.")
         sys.exit(1)
 
-    print("[LOG] Создание QApplication...")
     app_qt = QApplication(sys.argv)
-    print("[LOG] QApplication создано")
-
-    print("[LOG] Создание BrowserWindow...")
     window = BrowserWindow()
-    print("[LOG] BrowserWindow создано")
-
-    print("[LOG] Показ окна...")
     window.show()
-    print("[LOG] Окно показано")
-
-    print("[LOG] Запуск цикла обработки событий...")
     sys.exit(app_qt.exec())
