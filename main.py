@@ -179,7 +179,7 @@ class SafeBrowsingChecker:
     def __init__(self, api_key, parent=None):
         self.api_key = api_key
         self.api_url = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
-        self.enabled = self.api_key and self.api_key != "AIzaSyCxIKEwIyckbHKQS4nrKQ1MMizJDyrRrxM"
+        self.enabled = self.api_key and self.api_key != "Секретный ключь я вам не покажу"
         self.nam = QNetworkAccessManager(parent)
         self.cache = {}  # {domain: (is_safe, threat_type, timestamp)}
         self.cache_ttl = 3600  # 1 час
