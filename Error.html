@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title> Error </title>
+
+    <style>
+        body {
+            background: linear-gradient(to right, rgba(177, 10, 10, 0.8), rgba(102, 16, 242, 0.5))
+        }
+        h1 {
+            margin-top: 100px;
+            margin-left: 450px;
+            padding: 10px 20px;
+            color: rgb(255, 0, 0);
+            border: none;
+            font-size: 75px;
+            -webkit-text-stroke: 1px rgb(255, 255, 255);
+        }
+
+        .error-container {
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 30px;
+            background: rgba(0,0,0,0.7);
+            border-radius: 16px;
+            color: white;
+            font-family: 'Segoe UI', sans-serif;
+        }
+        .error-code {
+            font-size: 28px;
+            font-weight: bold;
+            color: #ff6b6b;
+        }
+        .error-message {
+            font-size: 18px;
+            margin-top: 20px;
+            line-height: 1.6;
+        }
+    </style>
+</head>
+<body>
+    
+    <h1>FreeSearch Error</h1>
+
+    <div class="error-container">
+        <div class="error-code">{ERROR_TITLE}</div>
+        <p class="error-message">{ERROR_DETAILS}</p>
+    </div>
+
+</body>
